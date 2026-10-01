@@ -18,7 +18,7 @@ env:
   ARM_USE_OIDC: true
 
 jobs:
-  plan:
+  generate-plan:
     runs-on: ubuntu-latest
 
     defaults:
