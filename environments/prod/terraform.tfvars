@@ -10,6 +10,6 @@ node_count   = 3
 node_vm_size = "Standard_D4s_v6"
 
 aks_sku_tier     = "Standard"
-node_pool_zones  = ["1", "2", "3"]
+node_pool_zones  = ["1", "3"]
 aks_pod_cidr     = "10.246.0.0/16"
 aks_service_cidr = "10.4.0.0/16"
