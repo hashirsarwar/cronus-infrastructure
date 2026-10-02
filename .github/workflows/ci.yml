@@ -1,0 +1,73 @@
+name: Cronus Infrastructure CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "environments/**"
+      - "modules/**"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TF_IN_AUTOMATION: true
+
+  ARM_CLIENT_ID: ${{ vars.AZURE_CI_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: true
+
+jobs:
+  format:
+    name: Terraform Format
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.6"
+
+      - name: Terraform format
+        run: terraform fmt -check -recursive .
+
+  plan:
+    name: Terraform Plan - ${{ matrix.environment }}
+
+    needs: format
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - nonprod
+          - prod
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.6"
+
+      - name: Terraform init
+        working-directory: environments/${{ matrix.environment }}
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        working-directory: environments/${{ matrix.environment }}
+        run: terraform validate
+
+      - name: Terraform plan
+        working-directory: environments/${{ matrix.environment }}
+        run: terraform plan -input=false
