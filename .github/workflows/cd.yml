@@ -1,0 +1,71 @@
+name: Cronus Infrastructure CD
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_IN_AUTOMATION: true
+
+jobs:
+  generate-plan:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: environments/prod/
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.6"
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: environments/prod/tfplan
+  
+  apply-plan:
+    needs: generate-plan
+
+    runs-on: ubuntu-latest
+
+    environment: production
+
+    concurrency:
+      group: terraform-production
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.6"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+          path: environments/prod
+
+      - name: Terraform init
+        working-directory: environments/prod
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        working-directory: environments/prod
+        run: terraform apply -input=false tfplan
