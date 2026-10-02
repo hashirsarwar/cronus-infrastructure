@@ -43,4 +43,3 @@ module "aks" {
   pod_cidr        = var.aks_pod_cidr
   service_cidr    = var.aks_service_cidr
 }
-//
