@@ -5,7 +5,7 @@ terraform {
     resource_group_name  = "rg-cronus-tfstate"
     storage_account_name = "cronustfstate001"
     container_name       = "tfstate"
-    key                  = "cronus/staging.tfstate"
+    key                  = "cronus/nonprod.tfstate"
     use_azuread_auth     = true
     use_cli              = true
   }
