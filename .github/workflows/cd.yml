@@ -1,0 +1,59 @@
+name: Cronus Infrastructure CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "environments/**"
+      - "modules/**"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_IN_AUTOMATION: true
+
+  ARM_CLIENT_ID: ${{ vars.AZURE_CD_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: true
+
+jobs:
+  deploy-nonprod:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.6"
+
+      - name: Terraform init
+        working-directory: environments/nonprod
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        working-directory: environments/nonprod
+        run: terraform apply -input=false -auto-approve
+
+  plan-prod:
+    needs: deploy-nonprod
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.6"
+
+      - name: Terraform init
+        working-directory: environments/prod
+        run: terraform init -input=false
+
+      - name: Terraform plan
+        working-directory: environments/prod
+        run: terraform plan -input=false
