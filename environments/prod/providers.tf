@@ -7,7 +7,6 @@ terraform {
     container_name       = "tfstate"
     key                  = "cronus/prod.tfstate"
     use_azuread_auth     = true
-    use_cli              = true
   }
 
   required_providers {
