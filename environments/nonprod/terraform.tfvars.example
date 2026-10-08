@@ -1,0 +1,339 @@
+# Copy this file before the first run:
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# The available subscriptions and their ids:
+#
+#   az account list --query "[].{name:name, id:id}" -o table
+subscription_id = "00000000-0000-0000-0000-000000000000"
+
+resource_group_name = "rg-cronus-nonprod"
+vnet_name           = "vnet-cronus-nonprod"
+vnet_address_space  = ["10.20.0.0/16"]
+
+# One subnet per workload. Ranges are assigned once and never renumbered, because changing a
+# subnet's prefix replaces the subnet and everything attached to it. 10.20.16.0/24 is
+# therefore left unused rather than recycled: it held the Application Gateway for Containers
+# subnet that the AKS application routing add-on replaced. Everything in use sits below
+# 10.20.20.0, which leaves the rest of the /16 free for later subnets.
+subnet_address_prefixes = {
+  aks               = ["10.20.0.0/20"]
+  postgres          = ["10.20.17.0/24"]
+  private_endpoints = ["10.20.18.0/24"]
+
+  # Dedicated to the API server and at least a /28, which is Microsoft's minimum: AKS
+  # reserves at least nine addresses there, and running out stops the API server scaling.
+  # Nothing else may be placed in this subnet, so it takes the smallest supported range.
+  aks_apiserver = ["10.20.19.0/28"]
+}
+
+acr_name = "acrcronusnonprod"
+acr_sku  = "Standard"
+
+key_vault_name                       = "kv-cronus-nonprod"
+key_vault_soft_delete_retention_days = 90
+
+# Nonprod deletes and recreates its vault, so purge protection is off and the name
+# can be released early with `az keyvault purge`. Prod keeps it on.
+key_vault_purge_protection_enabled = false
+
+# Cluster identities are per Terraform environment; workload identities are per application environment.
+# Nonprod contains dev and staging; production has its own identities.
+aks_identity_names = {
+  controlplane = "id-aks-controlplane-nonprod"
+  kubelet      = "id-aks-kubelet-nonprod"
+}
+
+workload_identity_names = {
+  ordering_dev     = "id-ordering-dev"
+  delivery_dev     = "id-delivery-dev"
+  ordering_staging = "id-ordering-staging"
+  delivery_staging = "id-delivery-staging"
+}
+
+# A second identity per application environment, assumed only by the job that migrates the
+# database. Its name is the PostgreSQL role name as well as the identity that job carries,
+# so renaming it here means renaming it in the bootstrap and in the job.
+migration_identity_names = {
+  ordering_dev     = "id-ordering-migrations-dev"
+  delivery_dev     = "id-delivery-migrations-dev"
+  ordering_staging = "id-ordering-migrations-staging"
+  delivery_staging = "id-delivery-migrations-staging"
+}
+
+postgres_server_name = "psql-cronus-nonprod"
+postgres_version     = "18"
+
+# Use the delegated-access private DNS zone, distinct from the server's public FQDN.
+# The zone name must end in postgres.database.azure.com.
+postgres_private_dns_zone_name = "psql-cronus-nonprod.private.postgres.database.azure.com"
+
+# Use Burstable for nonprod cost; production uses General Purpose for zone-redundant HA.
+postgres_sku_name                     = "B_Standard_B1ms"
+postgres_storage_mb                   = 32768
+postgres_backup_retention_days        = 7
+postgres_geo_redundant_backup_enabled = false
+
+# Both groups are created by the identities module, and each one is the only way in to
+# what it administers: password authentication is off on the server, and the cluster has
+# no local accounts. Members are object ids rather than names, and they are written out
+# rather than taken from whoever runs Terraform, so an automated run cannot add itself.
+#
+#   person:  az ad signed-in-user show --query id -o tsv
+#   group:   az ad group show --group <name> --query id -o tsv
+#
+# The postgres member is Hashir Sarwar.
+admin_groups = {
+  postgres_admins = {
+    name        = "grp-cronus-postgres-admins-nonprod"
+    description = "Administrators of the Cronus nonprod PostgreSQL server."
+    members     = ["27559288-f428-4435-9b9d-5904ae94fe4d"]
+  }
+
+  aks_admins = {
+    name        = "grp-cronus-aks-admins-nonprod"
+    description = "Cluster administrators of the Cronus nonprod Kubernetes cluster."
+    members     = ["27559288-f428-4435-9b9d-5904ae94fe4d"]
+  }
+}
+
+# Keys are ordered service first, like the workload identity keys, so the same
+# label identifies an application in both modules.
+postgres_database_names = {
+  ordering_dev     = "cronus_dev_ordering"
+  delivery_dev     = "cronus_dev_delivery"
+  ordering_staging = "cronus_staging_ordering"
+  delivery_staging = "cronus_staging_delivery"
+}
+
+aks_cluster_name       = "aks-cronus-nonprod"
+aks_dns_prefix         = "aks-cronus-nonprod"
+aks_kubernetes_version = "1.35"
+
+# Free omits the uptime SLA and the API server scale that comes with it, which is
+# the right trade for nonprod. Prod should use Standard.
+aks_sku_tier = "Free"
+
+# Overlay networking keeps pod addresses off the subnet, so these ranges must not
+# overlap the virtual network. Neither the pod range nor the service range can be
+# changed after the cluster is created.
+aks_pod_cidr = "10.244.0.0/16"
+
+# The first address of the service range is reserved for the default Kubernetes service,
+# so cluster DNS takes the tenth.
+aks_service_cidr = "10.96.0.0/16"
+aks_dns_service_ip = "10.96.0.10"
+
+# The API server is public and answers only these ranges. This one address is the current
+# office egress address; update it when it changes, because an address that is missing
+# here cannot run kubectl. CI will need its own range adding.
+aks_api_server_authorized_ip_ranges = ["88.97.179.44/32"]
+
+# Standard_D4s_v6 rather than the cheapest SKU: a system pool needs at least 4 vCPUs and
+# 4 GB, and Microsoft recommends 8 vCPUs across the pool to run the add-ons. Zones 1 and
+# 3 only: UK South advertises zone 2 for this SKU, but it is restricted for this
+# subscription, so a node placed there would fail.
+aks_system_node_pool = {
+  name      = "system"
+  vm_size   = "Standard_D4s_v6"
+  min_count = 2
+  max_count = 3
+  zones     = ["1", "3"]
+}
+
+# Application workloads run here, which is what the system pool's taint forces. This pool
+# carries dev and staging together; splitting them into separate pools is a later step,
+# and labels are the place to do it.
+aks_user_node_pools = {
+  workers = {
+    name      = "workers"
+    vm_size   = "Standard_D2s_v6"
+    min_count = 1
+    max_count = 4
+    zones     = ["1", "3"]
+  }
+}
+
+# Standard CRDs support the sidecar-less appRoutingIstio Gateway implementation.
+# The AKS module disables nginx to avoid a second ingress stack; GitOps owns Gateway and HTTPRoute.
+# See ../../modules/aks/README.md for the ingress profile ownership split.
+aks_gateway_api = {
+  installation           = "Standard"
+  app_routing_istio_mode = "Enabled"
+}
+
+# The Secrets Store CSI driver add-on. The Application Routing add-on reads its ingress
+# certificate from a Key Vault through it, which is what lets a rotated certificate reach
+# the running gateway without a restart. 2m is Azure's own default poll interval; it is
+# written out so that changing it is a visible edit.
+aks_key_vault_secrets_provider = {
+  secret_rotation_enabled  = true
+  secret_rotation_interval = "2m"
+}
+
+# Observability. Two workspaces, because they store different things and neither can hold the
+# other's data: metrics go to the Azure Monitor workspace behind managed Prometheus, and
+# container logs and Kubernetes events go to the Log Analytics workspace that Container
+# Insights writes to.
+log_analytics_workspace_name = "log-cronus-nonprod"
+azure_monitor_workspace_name = "amw-cronus-nonprod"
+
+# 30 days is the retention included in the price; longer is charged by volume.
+log_analytics_retention_in_days = 30
+
+# A daily cap on ingestion into the Log Analytics workspace. This is the control that keeps a
+# noisy cluster from becoming an unbounded bill: once the cap is reached, ingestion stops for
+# the rest of the day and the gap shows in the data until the cap is raised. It bounds the log
+# workspace only — Prometheus metrics are billed through the Azure Monitor workspace and are
+# not covered by it. -1 removes the cap.
+log_analytics_daily_quota_gb = 1
+
+# Collect logs, events and pod identity only; managed Prometheus already owns metrics.
+# Omitted inventory streams can be added when needed; see ../../modules/observability/README.md.
+container_insights_streams = [
+  "Microsoft-ContainerLogV2",
+  "Microsoft-KubeEvents",
+  "Microsoft-KubePodInventory",
+]
+
+# Kubernetes annotations and labels carried as dimensions on scraped metrics. Each distinct
+# combination is its own stored time series, so leaving both unset is the smallest and
+# cheapest setting, and is what a baseline wants. Set either to a comma-separated list of keys
+# to widen it. They are absent rather than set to an empty string because the provider rejects
+# an empty string, and an absent value means the same thing.
+#
+# metric_annotations_allowlist = "example.com/team"
+# metric_labels_allowlist      = "app.kubernetes.io/name"
+
+# Workload identity federation. Each subject names a Kubernetes namespace and service
+# account that cronus-gitops owns, so these strings have to agree with that repository;
+# a mismatch shows up only when a pod first tries to sign in. The keys are the credential
+# names in Entra ID.
+#
+# The audience is not set here. Direct Entra workload identity federation has exactly one
+# valid audience, so the identities module holds it rather than letting it be mistyped per
+# credential.
+workload_federated_credentials = {
+  cronus-dev-ordering = {
+    identity = "ordering_dev"
+    subject  = "system:serviceaccount:cronus-dev:cronus-ordering-service"
+  }
+
+  cronus-dev-delivery = {
+    identity = "delivery_dev"
+    subject  = "system:serviceaccount:cronus-dev:cronus-delivery-service"
+  }
+
+  cronus-staging-ordering = {
+    identity = "ordering_staging"
+    subject  = "system:serviceaccount:cronus-staging:cronus-ordering-service"
+  }
+
+  cronus-staging-delivery = {
+    identity = "delivery_staging"
+    subject  = "system:serviceaccount:cronus-staging:cronus-delivery-service"
+  }
+}
+
+# The same shape as the workload credentials above, and pointed at the cluster's issuer too.
+# The difference is the service account, which is deliberately not the one the deployment
+# runs as: a pod serving traffic claiming that subject must not be able to assume the
+# identity that may change the schema.
+#
+# The service account name carries no environment, because its namespace already says which
+# environment it is; the identity does, because it is an Azure resource that has to be
+# unique in the subscription.
+migration_federated_credentials = {
+  cronus-dev-ordering-migrations = {
+    identity = "ordering_dev"
+    subject  = "system:serviceaccount:cronus-dev:cronus-ordering-migrations"
+  }
+
+  cronus-dev-delivery-migrations = {
+    identity = "delivery_dev"
+    subject  = "system:serviceaccount:cronus-dev:cronus-delivery-migrations"
+  }
+
+  cronus-staging-ordering-migrations = {
+    identity = "ordering_staging"
+    subject  = "system:serviceaccount:cronus-staging:cronus-ordering-migrations"
+  }
+
+  cronus-staging-delivery-migrations = {
+    identity = "delivery_staging"
+    subject  = "system:serviceaccount:cronus-staging:cronus-delivery-migrations"
+  }
+}
+
+# Continuous integration publishing. One row per application, stating the three names that
+# have to agree: the identity Azure creates, the subject GitHub issues for the repository
+# allowed to assume it, and the registry repository the images are pushed to.
+#
+# The subjects carry owner and repository ids because all three repositories were created
+# after 15 July 2026, and GitHub issues immutable subjects for those: it will not issue the
+# shorter repo:<owner>/<repo>:ref:... form even when the claims are customised, so a
+# credential written against that form would never match a real run. The two ids are visible
+# with:
+#
+#   gh api repos/hashirsarwar/cronus-web --jq '"{}@{}".format(.owner.id, .id)'
+#
+# Only main is federated. A pull request runs the same tests, so it needs no Azure access at
+# all, and a fork's pull request could not assume the identity anyway.
+github_ci = {
+  web = {
+    identity_name  = "id-cronus-web-ci-nonprod"
+    subject        = "repo:hashirsarwar@45683359/cronus-web@1402723115:ref:refs/heads/main"
+    acr_repository = "cronus-web"
+  }
+
+  ordering = {
+    identity_name  = "id-cronus-ordering-service-ci-nonprod"
+    subject        = "repo:hashirsarwar@45683359/cronus-ordering-service@1402723822:ref:refs/heads/main"
+    acr_repository = "cronus-ordering-service"
+  }
+
+  delivery = {
+    identity_name  = "id-cronus-delivery-service-ci-nonprod"
+    subject        = "repo:hashirsarwar@45683359/cronus-delivery-service@1402726118:ref:refs/heads/main"
+    acr_repository = "cronus-delivery-service"
+  }
+}
+
+# Alerting. The rules live in the alerting module; what is here is who gets told and, where
+# the defaults are wrong for this environment, how sensitive the rules are.
+alert_action_group_name       = "ag-cronus-nonprod"
+alert_action_group_short_name = "cronus-nprd"
+
+# ---------------------------------------------------------------------------------------------
+# REPLACE BEFORE APPLYING. example.com is a reserved domain, so mail to this address is
+# discarded, and an Action Group with only this receiver notifies nobody. It is here as a
+# placeholder because a real address is not something to commit to this repository, and
+# because the module refuses an empty list rather than deploying a group that silently
+# accepts alerts and tells no one.
+#
+# Every alert rule in the baseline notifies this list. Adding a name here adds a recipient;
+# nothing else has to change.
+alert_email_receivers = ["replace-with-a-real-address@example.com"]
+# ---------------------------------------------------------------------------------------------
+
+# The alert thresholds are not set here, so the module's defaults apply. They are tuned to
+# stay quiet on a development and staging cluster: sustained node load rather than spikes,
+# three restarts in an hour rather than one, and a `for` duration on every rule so a condition
+# has to persist before anybody is told. See ../../modules/alerting/README.md.
+#
+# To make one stricter, set it here and it overrides the default:
+#
+# alert_thresholds = {
+#   node_cpu_percent = 95
+# }
+
+# Use one resource per service and environment, keyed for GitOps connection-string lookup.
+# Backends receive APPLICATIONINSIGHTS_CONNECTION_STRING; the browser reads /config.js.
+application_insights = {
+  ordering_dev     = "appi-ordering-dev"
+  delivery_dev     = "appi-delivery-dev"
+  web_dev          = "appi-web-dev"
+  ordering_staging = "appi-ordering-staging"
+  delivery_staging = "appi-delivery-staging"
+  web_staging      = "appi-web-staging"
+}

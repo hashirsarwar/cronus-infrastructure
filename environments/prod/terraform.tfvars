@@ -1,0 +1,420 @@
+# Production Cronus. This is the file that is deployed; terraform.tfvars.example is the
+# same values with a placeholder subscription and a placeholder alert address.
+#
+# Nothing here is a secret. A subscription id, a resource name and a public GitHub subject
+# identify things; none of them authenticates as anything, and no credential belongs in
+# this repository.
+subscription_id = "2781f7e7-99a8-45a0-8d55-cb37c0556b30"
+
+resource_group_name = "rg-cronus-prod"
+vnet_name           = "vnet-cronus-prod"
+
+# A /16 of production's own, well away from nonprod's 10.20.0.0/16. The environments are
+# not peered today and nothing requires them to be, but a range that could not be peered
+# without renumbering would be a constraint decided by accident rather than on purpose.
+vnet_address_space = ["10.30.0.0/16"]
+
+# The same layout as nonprod, at the same offsets, so that a subnet means the same thing in
+# every environment. Ranges are assigned once and never renumbered, because changing a
+# subnet's prefix replaces the subnet and everything attached to it. As in nonprod,
+# 10.30.16.0/24 is left unused deliberately and everything in use sits below 10.30.20.0.
+subnet_address_prefixes = {
+  aks               = ["10.30.0.0/20"]
+  postgres          = ["10.30.17.0/24"]
+  private_endpoints = ["10.30.18.0/24"]
+
+  # Dedicated to the API server and at least a /28, which is Microsoft's minimum: AKS
+  # reserves at least nine addresses there, and running out stops the API server scaling.
+  # Nothing else may be placed in this subnet, so it takes the smallest supported range.
+  #
+  # Production needs this subnet even though the API server is private. A private cluster
+  # with API server VNet integration projects the API server into this subnet and the nodes
+  # reach it through the internal load balancer address directly, without DNS.
+  aks_apiserver = ["10.30.19.0/28"]
+}
+
+# Admit port 80 for the HTTP Gateway declared in GitOps.
+# This opens plaintext public ingress; DNS and TLS require separate configuration.
+public_ingress = [{ port = 80, name = "allow-http-inbound" }]
+
+# Use a separate production registry so nonprod publishing grants do not authorize production writes.
+# Promote a source-registry digest with az acr import instead of rebuilding the image.
+acr_name = "acrcronusprod"
+acr_sku  = "Standard"
+
+# Promotion reads from nonprod's registry, so it is named here. Only the name, resource group
+# and subscription are needed; the registry itself is neither read nor managed by this
+# configuration. Stating the parts rather than a resource id is what makes a source in another
+# subscription a change to one field.
+promotion_source = {
+  subscription_id     = "2781f7e7-99a8-45a0-8d55-cb37c0556b30"
+  resource_group_name = "rg-cronus-nonprod"
+  registry_name       = "acrcronusnonprod"
+}
+
+# The two custom roles the image-promotion module creates, and they are two rather than one because
+# promotion needs two unrelated permissions.
+#
+# The importer role exists because no built-in role grants the import without also granting read of every
+# repository in the registry.
+import_role_definition_name = "Cronus Production Image Importer"
+
+# The source reader exists because an import has to be able to read the registry it copies *from* as a
+# resource, not merely read images inside it. No repository role grants that — they are all data actions —
+# and the built-in Reader would additionally grant read of everything else in nonprod's resource group.
+# Without it the import fails with LinkedAuthorizationFailed naming this action on that registry.
+source_read_role_definition_name = "Cronus Promotion Source Registry Reader"
+
+key_vault_name                       = "kv-cronus-prod"
+key_vault_soft_delete_retention_days = 90
+
+# On here and off in nonprod, which is the one place the two deliberately differ. Purge
+# protection is what stops a deleted vault, and every secret in it, being destroyed before
+# its retention period has run out. Nonprod turns it off so a rebuild can reuse the name;
+# production's vault is not something a rebuild should be able to take with it.
+key_vault_purge_protection_enabled = true
+
+# The cluster's identities belong to this environment. Workload identities belong to an
+# application environment, and production is one: nonprod carries dev and staging, and this
+# carries prod.
+aks_identity_names = {
+  controlplane = "id-aks-controlplane-prod"
+  kubelet      = "id-aks-kubelet-prod"
+}
+
+workload_identity_names = {
+  ordering_prod = "id-ordering-prod"
+  delivery_prod = "id-delivery-prod"
+}
+
+# A second identity per application, assumed only by the job that migrates the database. Its
+# name is the PostgreSQL role name as well as the identity that job carries, so renaming it
+# here means renaming it in the bootstrap and in the job.
+#
+# These are the identities that may change production's schema. They are not nonprod's, and
+# the credentials that federate them are issued by this cluster, so a nonprod migration job
+# cannot assume one however it is configured.
+migration_identity_names = {
+  ordering_prod = "id-ordering-migrations-prod"
+  delivery_prod = "id-delivery-migrations-prod"
+}
+
+postgres_server_name = "psql-cronus-prod"
+postgres_version     = "18"
+
+# Use a private zone distinct from the server FQDN; applications connect using the server's fqdn output.
+# Azure requires the zone name to end in postgres.database.azure.com.
+postgres_private_dns_zone_name = "psql-cronus-prod.private.postgres.database.azure.com"
+
+# Zone-redundant HA requires General Purpose rather than Burstable.
+# Start at the smallest SKU; the standby adds a second server's compute cost.
+postgres_sku_name = "GP_Standard_D2ds_v5"
+
+# 64 GiB rather than nonprod's 32. Storage size is also the provisioned IOPS, and the disks
+# step 120 IOPS at 32 GiB, 240 at 64. Auto-grow is on, so this is capacity headroom as well
+# as a performance floor. Storage cannot be shrunk, which is why it is worth starting at a
+# size that will not need to be argued about.
+postgres_storage_mb = 65536
+
+# Fourteen days of point-in-time restore, twice nonprod's window. The service accepts up to
+# 35; backup storage is included up to 100% of provisioned storage, so the cost of a longer
+# window at this size is nil and the reason not to take it is only that a longer window
+# mostly protects against losses that go unnoticed for a fortnight. Raising this is one
+# value, and it does not require a new server.
+postgres_backup_retention_days = 14
+
+# On, and this is the one database setting that has to be decided before the first apply
+# rather than after it: the service does not allow the backup storage redundancy to be
+# changed once a server is provisioned, so turning it on later means building a new server.
+#
+# It replicates backups to UK West, the paired region, which is what makes a regional
+# failure survivable at all — with local backups only, the backups go with the region. The
+# restore point is up to an hour behind, because replication of backups is not synchronous,
+# so this is disaster recovery and not a substitute for the standby.
+postgres_geo_redundant_backup_enabled = true
+
+# State initial placement to avoid a plan that removes the standby zone.
+# Ignore both zones after creation: failover swaps them; HA mode remains managed.
+# Node-pool SKU zone restrictions do not govern PostgreSQL placement.
+postgres_zone = "2"
+
+# A standby in a second zone, promoted automatically. It is billed as a second server of the
+# same size, and it is the difference between a zone failure being a failover and being an
+# outage.
+postgres_high_availability = {
+  mode                      = "ZoneRedundant"
+  standby_availability_zone = "1"
+}
+
+# Both groups are created by the identities module, and each one is the only way in to what
+# it administers: password authentication is off on the server, and the cluster has no local
+# accounts. Members are object ids rather than names, and they are written out rather than
+# taken from whoever runs Terraform, so an automated run cannot add itself.
+#
+#   person:  az ad signed-in-user show --query id -o tsv
+#   group:   az ad group show --group <name> --query id -o tsv
+#
+# Separate groups from nonprod's. Being able to administer the development database is not
+# a reason to be able to administer the production one, and keeping them apart is what makes
+# that true rather than merely intended.
+admin_groups = {
+  postgres_admins = {
+    name        = "grp-cronus-postgres-admins-prod"
+    description = "Administrators of the Cronus production PostgreSQL server."
+    members     = ["27559288-f428-4435-9b9d-5904ae94fe4d"]
+  }
+
+  aks_admins = {
+    name        = "grp-cronus-aks-admins-prod"
+    description = "Cluster administrators of the Cronus production Kubernetes cluster."
+    members     = ["27559288-f428-4435-9b9d-5904ae94fe4d"]
+  }
+}
+
+# Keys are ordered service first, like the workload identity keys, so the same label
+# identifies an application in both modules. The names carry `prod` rather than an
+# environment suffix that could be mistaken for a nonprod one, and they are the databases
+# the bootstrap grants the four production roles CONNECT on.
+postgres_database_names = {
+  ordering_prod = "cronus_prod_ordering"
+  delivery_prod = "cronus_prod_delivery"
+}
+
+aks_cluster_name       = "aks-cronus-prod"
+aks_dns_prefix         = "aks-cronus-prod"
+aks_kubernetes_version = "1.35"
+
+# Standard, unlike nonprod's Free. The tier buys the financially backed uptime SLA on the
+# control plane, which is what makes "the cluster is up" a commitment rather than an
+# expectation.
+aks_sku_tier = "Standard"
+
+# Overlay networking keeps pod addresses off the subnet. Production has a range of its own
+# rather than sharing nonprod's: neither the pod range nor the service range can be changed
+# after the cluster is created, so giving them distinct ranges costs nothing now and removes
+# a class of confusion later if the two networks are ever connected.
+aks_pod_cidr = "10.245.0.0/16"
+
+# The first address of the service range is reserved for the default Kubernetes service, so
+# cluster DNS takes the tenth.
+aks_service_cidr   = "10.97.0.0/16"
+aks_dns_service_ip = "10.97.0.10"
+
+# Private from the first apply, with no bootstrap window in which the API server is public.
+#
+# `System` lets AKS create and manage the private DNS zone that publishes the API server's
+# address inside the virtual network. Nothing outside that network resolves it, which is the
+# point.
+#
+# The authorized IP range list is empty because it has to be: authorized ranges apply to the
+# public API server endpoint and AKS refuses them on a private cluster. The AKS module
+# refuses the combination at plan time rather than leaving it to fail at the ARM API, since
+# the provider itself does not check it.
+#
+# Administration is therefore through Azure's control plane — `az aks command invoke` for
+# break-glass work, and Argo CD running inside the cluster for everything routine. That
+# needs the run command permission, which cluster-admin does not carry; the AKS module
+# grants the admin group the built-in role that has it, for private clusters only.
+aks_private_cluster_enabled = true
+aks_private_dns_zone_id     = "System"
+
+aks_api_server_authorized_ip_ranges = []
+
+# Standard_D4s_v6 rather than the cheapest SKU, and the same choice nonprod makes: a system
+# pool needs at least 4 vCPUs and 4 GB, and Microsoft recommends 8 vCPUs across the pool to
+# run the add-ons. Production runs the same add-ons — Container Insights, managed
+# Prometheus, Application Routing with its Istio control plane, and the Secrets Store CSI
+# driver — so the same floor applies.
+#
+# Zones 1 and 3 only. UK South has three zones, but this subscription is refused zone 2 for
+# this VM family: `az vm list-skus -l uksouth --size Standard_D2s_v6` reports
+# NotAvailableForSubscription for zone 2. A node asked for there would fail to place.
+#
+# Three at most rather than more: two zones are available, so a third system node adds
+# nothing to availability and only to the bill. The pool is zone-spanning, so the two nodes
+# are placed in different zones where the scheduler can.
+aks_system_node_pool = {
+  name      = "system"
+  vm_size   = "Standard_D4s_v6"
+  min_count = 2
+  max_count = 3
+  zones     = ["1", "3"]
+}
+
+# Application workloads run here, which is what the system pool's taint forces.
+#
+# Three nodes at minimum because two zones are available and the workloads are spread across
+# them: with three nodes and a schedule-anyway spread, the scheduler places two in one zone
+# and one in the other, and a zone failure leaves the surviving zone already carrying a
+# third of the applications rather than none. Two would also work and cost a third less; the
+# third node is the difference between a zone failure being a degraded service and being a
+# half-capacity one, which is the trade production is for.
+#
+# The ceiling of six leaves room for a rolling update to add a node without evicting
+# anything, and for a surge node during a node image upgrade.
+aks_user_node_pools = {
+  workers = {
+    name      = "workers"
+    vm_size   = "Standard_D2s_v6"
+    min_count = 3
+    max_count = 6
+    zones     = ["1", "3"]
+  }
+}
+
+# Use Standard CRDs and the sidecar-less appRoutingIstio implementation, matching nonprod.
+# GitOps declares the production Gateway; public NSG ingress and DNS/TLS remain separate decisions.
+# The AKS module disables nginx to avoid deploying a second ingress stack.
+aks_gateway_api = {
+  installation           = "Standard"
+  app_routing_istio_mode = "Enabled"
+}
+
+# The Secrets Store CSI driver. Nothing mounts from the vault yet — there is no certificate
+# and no secret in production — but the driver is part of the cluster's shape rather than
+# something to add later, and the add-on that will need it is already enabled.
+aks_key_vault_secrets_provider = {
+  secret_rotation_enabled  = true
+  secret_rotation_interval = "2m"
+}
+
+# Observability. Two workspaces, because they store different things and neither can hold
+# the other's data. Neither is nonprod's: production telemetry is the record of what
+# production did, and it does not belong in a workspace a development cluster can write to.
+log_analytics_workspace_name = "log-cronus-prod"
+azure_monitor_workspace_name = "amw-cronus-prod"
+
+# Keep a quarter's diagnostic history; additional retention is charged by stored volume.
+log_analytics_retention_in_days = 90
+
+# Set the cap above expected traffic so incident logs can keep flowing.
+# Reaching it stops ingestion for the day; it is a runaway-cost guard, not sampling.
+log_analytics_daily_quota_gb = 4
+
+# What Container Insights collects: container stdout and stderr, Kubernetes events, and pod
+# inventory. The metric streams are deliberately absent and the AKS module refuses them,
+# because managed Prometheus already collects metrics and collecting them twice stores and
+# bills them twice while letting the two stores disagree.
+container_insights_streams = [
+  "Microsoft-ContainerLogV2",
+  "Microsoft-KubeEvents",
+  "Microsoft-KubePodInventory",
+]
+
+# Kubernetes annotations and labels carried as dimensions on scraped metrics. Each distinct
+# combination is its own stored time series, so leaving both unset is the smallest and
+# cheapest setting. They are absent rather than set to an empty string because the provider
+# rejects an empty string, and an absent value means the same thing.
+#
+# metric_annotations_allowlist = "example.com/team"
+# metric_labels_allowlist      = "app.kubernetes.io/name"
+
+# Match subjects to GitOps namespace and ServiceAccount names; a mismatch fails pod sign-in.
+# The identities module fixes the audience to avoid invalid per-credential overrides.
+workload_federated_credentials = {
+  cronus-prod-ordering = {
+    identity = "ordering_prod"
+    subject  = "system:serviceaccount:cronus-prod:cronus-ordering-service"
+  }
+
+  cronus-prod-delivery = {
+    identity = "delivery_prod"
+    subject  = "system:serviceaccount:cronus-prod:cronus-delivery-service"
+  }
+}
+
+# The same shape as the workload credentials, and pointed at the cluster's issuer too. The
+# difference is the service account, which is deliberately not the one the deployment runs
+# as: a pod serving traffic claiming that subject must not be able to assume the identity
+# that may change the schema.
+migration_federated_credentials = {
+  cronus-prod-ordering-migrations = {
+    identity = "ordering_prod"
+    subject  = "system:serviceaccount:cronus-prod:cronus-ordering-migrations"
+  }
+
+  cronus-prod-delivery-migrations = {
+    identity = "delivery_prod"
+    subject  = "system:serviceaccount:cronus-prod:cronus-delivery-migrations"
+  }
+}
+
+# Production promotion uses separate identities; ordinary CI publishes only to nonprod.
+# Only main is federated. Keep immutable owner/repository IDs in the issued subjects.
+# See ../nonprod/terraform.tfvars.example and README.md for subject format and release wiring.
+github_ci = {
+  web = {
+    identity_name  = "id-cronus-web-ci-prod"
+    subject        = "repo:hashirsarwar@45683359/cronus-web@1402723115:ref:refs/heads/main"
+    acr_repository = "cronus-web"
+  }
+
+  ordering = {
+    identity_name  = "id-cronus-ordering-service-ci-prod"
+    subject        = "repo:hashirsarwar@45683359/cronus-ordering-service@1402723822:ref:refs/heads/main"
+    acr_repository = "cronus-ordering-service"
+  }
+
+  delivery = {
+    identity_name  = "id-cronus-delivery-service-ci-prod"
+    subject        = "repo:hashirsarwar@45683359/cronus-delivery-service@1402726118:ref:refs/heads/main"
+    acr_repository = "cronus-delivery-service"
+  }
+}
+
+# Alerting. The rules live in the alerting module; what is here is who gets told and how
+# sensitive the rules are.
+#
+# A group of its own rather than nonprod's, so that silencing a noisy development cluster
+# cannot silence production, and adding somebody to the production on-call list is a change
+# to this file and not to the shared one.
+alert_action_group_name       = "ag-cronus-prod"
+alert_action_group_short_name = "cronus-prod"
+
+# Every production alert notifies this list; keep at least one reachable recipient configured.
+alert_email_receivers = ["hashir.sarwar@outlook.com"]
+
+# Use stricter sustained thresholds than nonprod so production capacity failures surface sooner.
+# Shorter hold times improve detection while still suppressing transient rollout noise.
+alert_thresholds = {
+  # Sustained load rather than a spike. Fifteen minutes instead of nonprod's thirty:
+  # a node pinned for a quarter of an hour is a problem on a cluster with three of them.
+  node_cpu_percent = 90
+  node_cpu_for     = "PT15M"
+
+  node_memory_percent = 90
+  node_memory_for     = "PT15M"
+
+  # A node that has been NotReady for five minutes is already a capacity problem, because
+  # the workloads on it are being rescheduled onto the nodes that remain.
+  node_not_ready_for = "PT5M"
+
+  # A container that keeps dying is not going to stop on its own.
+  crashloop_for = "PT5M"
+
+  # Two restarts in half an hour, rather than nonprod's three in an hour. A single restart
+  # is still not worth waking anybody for: a probe can fail once and a rollout restarts
+  # containers deliberately.
+  restarts_threshold = 2
+  restarts_window    = "30m"
+  restarts_for       = "PT5M"
+
+  # An OOM kill is immediate rather than sustained, so the window is short.
+  oom_for = "PT1M"
+
+  # Below nine in ten of the desired replicas, held for five minutes.
+  ready_ratio_threshold = 0.9
+  ready_state_for       = "PT5M"
+}
+
+# One resource per service, all storing into the production workspace above.
+#
+# The keys matter: they are how the connection string output is keyed, so the deployment
+# looks up an entry by the environment and service it is deploying rather than by position.
+# The environment in the key is `prod` throughout, because production is one application
+# environment — dev and staging are nonprod's, and there is no fourth.
+application_insights = {
+  ordering_prod = "appi-ordering-prod"
+  delivery_prod = "appi-delivery-prod"
+  web_prod      = "appi-web-prod"
+}

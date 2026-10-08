@@ -1,0 +1,24 @@
+# Copy this file before the first run:
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# This repository commits terraform.tfvars, which is safe because nothing here
+# is a secret: the state account refuses shared key access, so there is no key
+# to keep anywhere in the first place.
+#
+# The subscription that owns the current CLI session:
+#
+#   az account show --query id -o tsv
+subscription_id = "00000000-0000-0000-0000-000000000000"
+
+# Optional: let another principal, such as the CI service principal, read and
+# write state.
+#
+#   az ad sp list --display-name cronus-github-ci --query "[0].id" -o tsv
+#
+# state_access_principals = {
+#   ci = {
+#     object_id      = "00000000-0000-0000-0000-000000000000"
+#     principal_type = "ServicePrincipal"
+#   }
+# }
